@@ -1,35 +1,36 @@
-// The brief's two documents, the free model list, and the catalog.
+// Reading the brief: the free model list and the prompt list.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the
-// prose around them does not matter: this file finds each by its `schema` member, under this contest's
-// prefix (`free-model-aggregator-02/`).
+// A trial hands this entry a brief file (the path in MAKEFUN_PROMPT_FILE). The brief is prose
+// wrapped around two JSON documents, and only the documents matter — the prose is never parsed.
+// Each document is found by the `schema` member it carries, under this contest's prefix:
 //
-//   - the free model list (`free-model-aggregator-02/models/v1`): one row a model, keyed by the id the
-//     gateway routes (`openrouter/<vendor>/<model>:free`), with the model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
-//     free model may serve a prompt; this baseline never routes a paid one.
-//   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
-//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its
-//     weight (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
-//     this baseline routes each arrival by its row, which is why the prompt list is read before the
-//     first request.
+//   - the model list (`free-model-aggregator-02/models/v1`): one row per model, keyed by the id
+//     the gateway routes (`openrouter/<vendor>/<model>:free`), carrying the model's public rating
+//     in milli-points, its capabilities (tools, vision, JSON mode, context length) and its free
+//     flag. Only free models may serve a prompt; a paid model is never routed, whatever the brief
+//     says about it.
+//   - the prompt list (`free-model-aggregator-02/prompts/v1`): the six prompts the house's client
+//     will send, in order, each with its id, its wire shape (`openai` or `anthropic`), whether it
+//     streams, its weight (1 or 2) and the capabilities a model must have to serve it. The client
+//     sends the bodies; this file routes each arrival from its row, which is why the prompt list
+//     is read before the first request is served.
 //
-// A brief may spell the model list `models` or `ratings` and the prompts `prompts` or `manifest` (the
-// sibling -01 contest's names), and one document may carry both; a document is found by the arrays it
-// carries, never by a name alone. The brief's own prose is never parsed.
+// A brief may name the lists `models` or `ratings` and `prompts` or `manifest` (the sibling -01
+// contest's names), and a single document may carry both lists; a document is found by the arrays
+// it carries, never by a name alone.
 //
-// Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
-// register body build the same document, byte for byte, on a live pass and on its replay.
+// Nothing here reads the clock or rolls dice, so `node main.ts --list` and the register body build
+// the same document, byte for byte, on a live pass and on its replay.
 
 import { readFileSync } from 'node:fs';
 
 export const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
 export const PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1';
 
-/** Every schema this contest's brief writes names this prefix; the brief's JSON is found by it. */
+/** The schema prefix every document in this contest's brief carries; the brief's JSON is found by it. */
 const SCHEMA_PREFIX = 'free-model-aggregator-02/';
 
-/** The public base URL of the provider the free models belong to: the endpoint the gateway reaches for them. */
+/** The public base URL of the provider the free models belong to: the endpoint the gateway reaches. */
 export const OPENROUTER_PUBLIC_BASE = 'https://openrouter.ai/api/v1';
 /** The environment variable an entrant's OpenRouter key is pushed under (an entry secret, kept out of the sandbox). */
 export const OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY';
@@ -105,24 +106,42 @@ export interface Capabilities {
   json: boolean | null;
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
+/** A string field, or '' when the value is not a string. */
+function asString(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+/** A finite number, or null when the value is not one. */
+function asFiniteNumber(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/** A boolean, or null when the value is not one. */
+function asBoolean(v: unknown): boolean | null {
+  return typeof v === 'boolean' ? v : null;
+}
+
+/**
+ * Every JSON object in `text` that carries a string `schema`, in the order they appear in the
+ * text. A `{` that does not open a parseable object on its own is skipped and the scan moves on.
+ */
+function findSchemaDocuments(text: string): Json[] {
+  const found: Json[] = [];
   for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
+    const end = matchingCloseBrace(text, start);
     if (end === -1) continue;
     try {
       const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
+      if (isRecord(value) && typeof value.schema === 'string') found.push(value);
     } catch {
       // Not JSON on its own: look on.
     }
   }
-  return out;
+  return found;
 }
 
 /** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
+function matchingCloseBrace(text: string, start: number): number {
   let depth = 0;
   let inString = false;
   for (let i = start; i < text.length; i++) {
@@ -140,59 +159,50 @@ function objectEnd(text: string, start: number): number {
   return -1;
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
 /**
- * The first document under this contest's prefix that carries one of `keys` as an array: the document
- * and the key it was found under. A brief that spells its lists in the sibling's names still reads.
+ * The first document under this contest's prefix that carries one of `keys` as an array: the
+ * document and the key it was found under. A brief that spells its lists in the sibling's names
+ * still reads.
  */
-function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
+function firstDocumentWithArray(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
   for (const doc of docs) {
-    const schema = stringOf(doc.schema);
-    if (!schema.includes(SCHEMA_PREFIX)) continue;
-    for (const key of keys) if (Array.isArray(doc[key])) return { doc, key };
+    if (!asString(doc.schema).includes(SCHEMA_PREFIX)) continue;
+    for (const key of keys) {
+      if (Array.isArray(doc[key])) return { doc, key };
+    }
   }
   return null;
 }
 
 /**
- * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
- * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
- * spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free unless it
- * says `free: false`; a paid row is never routed.
+ * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row
+ * that gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the
+ * gateway spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free
+ * unless it says `free: false`; a paid row is never routed.
  */
-function modelOf(v: unknown): ModelRow | null {
+function parseModelRow(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
+  const raw = asString(v.id) !== '' ? asString(v.id) : asString(v.model);
   if (raw === '') return null;
-  const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
+  const named = asString(v.provider) !== '' ? asString(v.provider) : asString(v.wire);
   const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
   return {
     id,
     provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    display_name: asString(v.display_name) !== '' ? asString(v.display_name) : raw,
+    rating_milli: asFiniteNumber(v.rating_milli) ?? 0,
+    context_length: asFiniteNumber(v.context_length),
+    tools: asBoolean(v.tools),
+    vision: asBoolean(v.vision),
+    json: asBoolean(v.json),
     free: v.free !== false,
   };
 }
 
-function promptOf(v: unknown): PromptRow | null {
+/** One prompt row: only the fields the brief actually sets are kept. */
+function parsePromptRow(v: unknown): PromptRow | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+  const id = asString(v.id);
   if (id === '') return null;
   const requires = isRecord(v.requires) ? v.requires : {};
   return {
@@ -204,7 +214,9 @@ function promptOf(v: unknown): PromptRow | null {
       ...(requires.tools === true ? { tools: true } : {}),
       ...(requires.vision === true ? { vision: true } : {}),
       ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
+      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context)
+        ? { min_context: requires.min_context }
+        : {}),
     },
   };
 }
@@ -218,21 +230,21 @@ export function readBrief(path: string): Brief {
   } catch (err) {
     return { models: [], prompts: [], error: `cannot read ${path}: ${(err as Error).message}` };
   }
-  const docs = documentsIn(text);
-  const modelsDoc = arrayDocument(docs, ['models', 'ratings']);
+  const docs = findSchemaDocuments(text);
+  const modelsDoc = firstDocumentWithArray(docs, ['models', 'ratings']);
   if (modelsDoc === null) {
     return { models: [], prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document` };
   }
   const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
-    const m = modelOf(v);
+    const m = parseModelRow(v);
     return m === null ? [] : [m];
   });
-  const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
+  const promptsDoc = firstDocumentWithArray(docs, ['prompts', 'manifest']);
   if (promptsDoc === null) {
     return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
   }
   const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
-    const p = promptOf(v);
+    const p = parsePromptRow(v);
     return p === null ? [] : [p];
   });
   return { models, prompts, error: null };
@@ -258,20 +270,22 @@ export function meetsRequirements(requires: Requirement, caps: Capabilities): bo
   if (requires.tools === true && caps.tools !== true) return false;
   if (requires.vision === true && caps.vision !== true) return false;
   if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
+  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) {
+    return false;
+  }
   return true;
 }
 
 /**
  * The catalog the brief's free model list makes: one provider, the models it serves.
  *
- * The base_url is the provider's public endpoint, never the gateway's trial-local address: the gateway's
- * origin differs between a live pass and its replay, and the catalog is part of the state export a
- * replay must reproduce byte for byte.
+ * The base_url is the provider's public endpoint, never the gateway's trial-local address: the
+ * gateway's origin differs between a live pass and its replay, and the catalog is part of the state
+ * export a replay must reproduce byte for byte.
  *
  * This baseline lists every free model in the brief — exactly the fourteen dialable ids the catalog
- * column scores — so keep it that way: register this set and keep GET /v1/models (both auth headers)
- * exactly that set, since listing fewer loses the column as surely as listing more.
+ * column scores — so keep it that way: register this set and keep GET /v1/models (both auth
+ * headers) exactly that set, since listing fewer loses the column as surely as listing more.
  */
 export function buildCatalog(brief: Brief): CatalogReport {
   const seen = new Set<string>();
